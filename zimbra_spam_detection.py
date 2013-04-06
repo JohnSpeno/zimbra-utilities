@@ -1,200 +1,328 @@
 #!/usr/local/bin/python
-"""
-Scans Zimbra and Postfix maillogs to determine how much mail each sender has
-sent (via ZWC only) and warns if too much mail was sent by someone.
+'''
+Scans Zimbra and Postfix log files to determine how much mail each sender has
+sent.
+
+Warns if too much mail was sent by someone.
 
 Also warns about mail sent from outside addresses.
 
-Can automatically lock Zimbra accounts if more than --critical option messages
+Can automatically lock Zimbra accounts if more than --lock option messages
 were sent by an account.
 
 Accounts in a whitelist file are exempt from warning and locking.
-"""
+'''
+import collections
 import time
 import re
+from operator import itemgetter
 from optparse import OptionParser
 
 MY_DOMAIN = 'yourdomain.com'
-MY_HOSTNAME = 'myhostname.yourdomain.com'
 
-getmessageid = re.compile(r'\[name=([^@]+)@.*Message-ID=<([^>]+)>').search
+def lock_account(sender, count):
+    '''
+    Insert code to lock an account here.
+    '''
+    pass
 
-getpostfixmessageid = re.compile(
-    "postfix\/cleanup.*message-id=<([^>]+)>").search
+# zimbra mailbox log
+# groups = (user, message id)
+get_mid2user = re.compile(
+    r'\[name=([^@;]+).* smtp .*Message-ID=<([^>]+)>').search
 
-class EmailBurst(object):
-    def __init__(self, logfilename='/var/log/syslog/mail.log',
-                    mailboxlog='/opt/zimbra/log/mailbox.log',
-                    whitelist=None):
-        """
-        mailboxlog - The zimbra log.
-        logfilename - The postfix log.
-        whitelist - list of exempt sender addresses.
-        """
-        self.logfilename = logfilename
-        self.mailboxlogfilename = mailboxlog
-        self.logfile = None
-        self.mailboxlog = None
-        if whitelist is None:
-            whitelist = []
-        self.whitelist = whitelist
-        self.queueids = {}
+# postfix mail log
+# groups = (queue id, message id)
+get_mid2qid = re.compile(
+    r'postfix/cleanup.*: ([0-9A-F]+): message-id=<([^>]+)>').search
 
-    def tailfile(self):
-        self.logfile.seek(0, 2)
-        self.mailboxfile.seek(0, 2)
+# postfix mail log
+# groups = (queue id, host, ip, user)
+get_qid2user = re.compile(
+    r'postfix/smtpd.*: ([0-9A-F]+): client=(\S*)\[([\d\.]*)\].*sasl_username=([^@\s]+)').search
 
-    def openfile(self):
-        self.logfile = open(self.logfilename)
-        self.mailboxfile = open(self.mailboxlogfilename)        
+# postfix mail log
+# groups = (queue id, from address, num recipients)
+get_qid2from = re.compile(
+    r'postfix/qmgr.*: ([0-9A-F]+):.*from=<([^>]*)>.*nrcpt=(\d+)').search
 
-    def getrate(self):
-        total_sent = 0
-        senderdict = {}
-        outsiders = {}
-        realsenders = {}
+class SmtpClient(object):
+    '''Contains the hostname and ip of an SMTP client.
 
-        # first retrieve "real" sender ID from mailbox.log
-        for l in self.mailboxfile:
-            m = getmessageid(l)
+    Compares equal to another SmtpClient if their top- and second-level domain
+    names match (so all SmtpClients with hostname=*.example.net will compare
+    equal). This is to collapse SMTP client entries during scan_logs(); for
+    example, legitimate connections from multiple google.com addresses for
+    users sending mail from Gmail via our SMTP servers.
+    '''
+
+    def __init__(self, hostname, ip):
+        self.hostname
+        self.ip = hostname, ip
+        parts = hostname.rsplit('.', 2)
+        self.sldn = '.'.join(parts[-2:-1]) if len(parts) >= 2 else ip
+
+    def __eq__(self, other):
+        return type(self) is type(other) and self.sldn == other.sldn
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash(self.sldn)
+
+    def __str__(self):
+        return "%s[%s]" % (self.hostname, self.ip)
+
+def scan_logs(maillogpath, mailboxlogpath, timeinterval=0, whitelist=None):
+    '''
+    This covers two attack vectors:
+
+    1. Via ZWC. Use mailbox log to map message IDs to users, then use mail log
+       postfix/cleanup lines to map queue IDs via message IDs to users. 
+    2. Via SMTP. Use mail log postfix/smtpd lines to map queue IDs to users.
+       Also keep track of the different hosts the user connects from.
+
+    Once queue IDs are mapped to users, use mail log postfix/qmgr lines to
+    count how many messages were sent by each user and record any outside
+    from addresses.
+
+    Returns (counts, outside, user2host).
+    '''
+    if whitelist is None:
+        whitelist = []
+
+    # maps username -> msg count
+    counts = collections.defaultdict(int)
+    # maps (username, fromaddr) -> msg count for outside addresses
+    outside = collections.defaultdict(int)
+    # maps username -> {smtp client hostname, ip}
+    user2host = collections.defaultdict(set)
+
+    mid2user = {}
+    qid2user = {}
+
+    with open(maillogpath) as maillog, open(mailboxlogpath) as mailboxlog:
+        if timeinterval:
+            maillog.seek(0, 2)
+            mailboxlog.seek(0, 2)
+            time.sleep(timeinterval * 60)
+
+        # Mapping of message IDs to users, for those using ZWC, etc.
+        for l in mailboxlog:
+            m = get_mid2user(l)
             if m:
-                (sender, messageid) = m.groups()
-                realsenders[messageid] = sender
+                user, messageid = m.groups()
+                user = user.lower()
+                mid2user[messageid] = user
 
-        # now examine mail log for webmail entries
-        client = 'client=%s' % MY_HOSTNAME
-        for l in self.logfile:
-            if "postfix/smtpd" in l and client in l:
-                parts = l.split()
-                try:
-                    queueid = parts[5]
-                except IndexError:
+        for l in maillog:
+            # Mapping of queue IDs to users, for direct smtp
+            m = get_qid2user(l)
+            if m:
+                queueid, host, ip, user = m.groups()
+                user = user.lower()
+                qid2user[queueid] = user
+                user2host[user].add(SmtpClient(host, ip))
+                continue
+
+            # Mapping of queue IDs via message IDs to users, for ZWC, etc.
+            m = get_mid2qid(l)
+            if m:
+                queueid, messageid = m.groups()
+                if messageid in mid2user:
+                    qid2user[queueid] = mid2user[messageid]
+                elif queueid not in qid2user:
+                    qid2user[queueid] = 'Unknown'
+                continue
+
+            # Mapping of messages (from address and count)
+            # via queue IDs to users.
+            m = get_qid2from(l)
+            if m:
+                queueid, fromaddr, num_recipients = m.groups()
+                # just use lowercase version of fromaddr
+                fromaddr = fromaddr.lower()
+                num_recipients = int(num_recipients)
+
+                if queueid not in qid2user:
+                    # Log entries for message are split between runs--ignore
                     continue
-                self.queueids[queueid] = True
-            elif "postfix/cleanup" in l:
-                parts = l.split()
-                try:
-                    queueid = parts[5]
-                except IndexError:
+                user = qid2user[queueid]
+
+                # At this point, the following are possible:
+                #
+                # 1. username and fromaddr
+                #    Normal; log it
+                # 2. username, no fromaddr
+                #    Set fromaddr to mailer-daemon and log it
+                # 3. no username, fromaddr
+                #    Can happen (e.g. CalendarInviteForwardSender); don't log,
+                #    since they would all be for user 'Unknown'
+                # 4. no username, no fromaddr
+                #    Don't log, for same reason
+
+                if user == 'Unknown':
                     continue
-                if queueid in self.queueids:
-                    # find real sender
-                    messageid = parts[6][12:-1]
-                    self.queueids[queueid] = realsenders.get(messageid, 'Unknown')
-            elif "postfix/qmgr" in l and "from=" in l:
-                try:
-                    parts = l.split()
-                    queueid = parts[5]
-                    if queueid not in self.queueids:
-                        continue
-                    recipients = int(parts[-3].split('=')[-1])
-                    fromaddr =  parts[6][6:-2]
-                    realsender = self.queueids.get(queueid)                    
-                    if not fromaddr:
-                        fromaddr = 'mailer-daemon'
-                    keyid = (fromaddr, realsender)
-                    fl = fromaddr.lower()
-                    if (
-                        fromaddr != 'mailer-daemon'
-                        and not fl.endswith(MY_DOMAIN)
-                        and fl not in self.whitelist
+                if not fromaddr:
+                    fromaddr = 'mailer-daemon'
+
+                # check for outside address and update count
+                if (
+                    fromaddr != 'mailer-daemon'
+                    and not fromaddr.endswith(MY_DOMAIN)
+                    and fromaddr not in whitelist
                     ):
-                        sendercnt = outsiders.get(fromaddr, 0)
-                        sendercnt += recipients
-                        if realsender != 'Unknown':
-                            outsiders[keyid] = sendercnt
+                    outside[(user, fromaddr)] += num_recipients
 
-                    sendercnt = senderdict.get(keyid, 0)
-                    sendercnt += recipients
-                    # individual count
-                    if realsender != 'Unknown':
-                        senderdict[keyid] = sendercnt
-                        # total count
-                        total_sent += recipients
-                except:
-                    total_sent += 1
-        senderlist = list(senderdict.iteritems())
+                # update individual count
+                counts[user] += num_recipients
 
-        return total_sent, senderlist, outsiders
+    return counts, outside, user2host
 
-if __name__ == "__main__":
+def check_threshold(senders, threshold, message=""):
+    '''Print a message if the counts in senders exceed threshold.
+
+    senders -- iterable of tuples (sender, count)
+    threshold -- if a count exceeds this, print "count: sender"
+    message -- if any count exceeds threshold, print this first
+
+    The current implementation prints elements in descending order of count.
+    '''
+    # sort senders based on each element's count (which is its second item)
+    senders  = sorted(senders, key=itemgetter(1), reverse=True)
+
+    # only proceed if the first element's count is greater than the threshold
+    if senders and senders[0][1] >= threshold:
+        if message:
+            print message
+        for sender, count in senders:
+            if count < threshold:
+                break # since the list is sorted, we're done
+            print '%d:\t%s' % (count, sender)
+
+def main(options):
+
+    # Open the whitelist file, but ignore it if we can't
+    try:
+        with open(options.whitelist) as whitelistfile:
+            whitelist = whitelistfile.read().lower().split('\n')
+    except IOError:
+        whitelist = None
+
+    counts, outside, user2host = scan_logs(
+            options.maillog, options.mailboxlog,
+            options.timeinterval, whitelist
+    )
+
+    # sort on messages sent (second field), most to least
+    counts = sorted(counts.iteritems(), key=itemgetter(1), reverse=True)
+    for sender, count in counts:
+        msgs_per_minute = count / (options.timeinterval or 5)
+            
+        # lock account if more than lock threshold
+        if msgs_per_minute > options.lock:
+            print 'LOCKING %s %d messages sent/minute' % (
+                sender, msgs_per_minute
+            )
+            if not options.test:
+                # do account lock here
+                pass
+            else:
+                lock_account(sender, count)
+        # warn if more than warning threshold
+        elif msgs_per_minute > options.warn and not options.quiet:
+            print 'WARNING %s %d messages sent/minute' % (
+                sender, msgs_per_minute
+            )
+        else: # since the list is sorted, we're done
+            break
+
+    # The remaining notifications are warning-only.
+    if not options.quiet:
+        # outside from addresses
+        check_threshold(
+            outside.iteritems(),
+            options.fromthreshold,
+            '\nAlert: more than %d messages sent from outside address'
+                % options.fromthreshold
+        )
+
+        # multiple SMTP clients
+        check_threshold(
+            ((user, len(hosts)) for user, hosts in user2host.iteritems()),
+            options.clientwarn,
+            '\nAlert: more than %d SMTP clients for user' % options.clientwarn
+        )
+
+if __name__ == '__main__':
     parser = OptionParser()
-    parser.add_option('--maillog',dest="maillog", help="postfix maillog")
-    parser.add_option('--mailboxlog',dest="mailboxlog",
-                     help="zimbra mailboxlog"
-    )
-    parser.add_option('--quiet', '-q', dest="quiet",
-                      help="supress report output",
-                      default=False, action="store_true"
-    )
-    parser.add_option('--warn', dest="warn",
-                      help="messages per minute (default warn 100 msgs/minute)",
-                      default=100, type='int'
-    )
-    parser.add_option('--critical', dest="critical",
-                      help="messages per minute (lock after 1000 msgs/minute)",
-                      default=1000, type='int'
-    )    
-    parser.add_option('--timeinterval', dest="timeinterval",
-                      help="monitor for X minutes (default 5)",
-                      default=5, type='int'
-    )
-    parser.add_option('-t','--test', dest='test',
-                      help="test mode", action='store_true', default=False
-    )
+    parser.add_option(
+        '--maillog',
+        dest='maillog',
+        help='postfix maillog (default %default)',
+        default='/var/log/syslog/mail.log'
+        )
+    parser.add_option(
+        '--mailboxlog',
+        dest='mailboxlog',
+        help='zimbra mailboxlog (default %default)', 
+        default='/opt/zimbra/log/mailbox.log'
+        )
+    parser.add_option(
+        '--whitelist',
+        dest='whitelist',
+        help='whitelist for outside from addrs (default %default)',
+        default='/usr/local/etc/badspammer/whitelist.txt'
+        )
+    parser.add_option(
+        '--quiet', '-q',
+        dest='quiet',
+        help='suppress warning messages',
+        default=False,
+        action='store_true'
+        )
+    parser.add_option(
+        '--warn', dest='warn',
+        help='warn after X messages per minute (default %default)',
+        default=100,
+        type='int'
+        )
+    parser.add_option(
+        '--lock',
+        dest='lock',
+        help='lock account after X messages per minute (default %default)',
+        default=1000,
+        type='int'
+        )    
+    parser.add_option(
+        '--timeinterval', 
+        dest='timeinterval',
+        help='monitor for X minutes (default %default, 0 to read current log)',
+        default=5,
+        type='int'
+        )
+    parser.add_option(
+        '--fromthreshold',
+        dest='fromthreshold',
+        help='display outside from addrs if > X messages (default %default)',
+        default=10,
+        type='int'
+        )
+    parser.add_option(
+        '--clientwarn',
+        dest='clientwarn',
+        help='warn if > X different SMTP client hosts (default %default)',
+        default=20,
+        type='int'
+        )
+    parser.add_option(
+        '-t',
+        '--test',
+        dest='test',
+        help="test mode (don't lock accounts)",
+        default=False, action='store_true'
+        )
 
     options, args = parser.parse_args()
-   
-    try:
-        whitelist = open('/usr/local/etc/badspammer/whitelist.txt').read()
-        whitelist = whitelist.lower().split('\n')
-    except:
-        whitelist = None
-    
-    e = EmailBurst(whitelist=whitelist)
-    if options.maillog:
-        e.logfilename = options.maillog
-    if options.mailboxlog:
-        e.mailboxlogfilename = options.mailboxlog
-        
-    e.openfile()
-
-    if options.timeinterval:
-        e.tailfile()
-        time.sleep(options.timeinterval * 60)
-
-    total_msgs_sent, senderlist, outsiders = e.getrate()
-
-    if options.timeinterval:
-        msgs_per_minute =  total_msgs_sent / options.timeinterval
-    else:
-        msgs_per_minute = total_msgs_sent / 5
-
-    # sort the list based on messages sent
-    senderlist.sort(lambda a, b: cmp(b[1], a[1]))
-
-    if outsiders and not options.quiet:
-        print "Automated Warning: Alert non-upenn.edu message sent\n"
-        for sender in outsiders:            
-            print "%d:\t%s (%s)" %(outsiders[sender], sender[0], sender[1])
-            
-    if msgs_per_minute > options.warn and not options.quiet:
-        print (
-            "Automated Warning: Alert %d messages sent by webmail "
-            "in one minute\n" % (options.warn)
-        )
-        print "Top senders"
-        for (sender, msgs) in senderlist[:5]:
-            print "%d:\t%s (%s)" % (msgs, sender[0], sender[1])
-            
-    for sender, msgs_sent in senderlist:
-        if options.timeinterval:
-            msgs_per_minute =  msgs_sent / options.timeinterval
-        else:
-            msgs_per_minute = msgs_sent / 5
-            
-        if msgs_per_minute > options.critical:
-            print "LOCKING %s %d messages sent/minute" % (
-                sender[1], msgs_per_minute
-            )
-            # do account lock here
+    main(options)
