@@ -57,10 +57,13 @@ class SmtpClient(object):
     '''
 
     def __init__(self, hostname, ip):
-        self.hostname
-        self.ip = hostname, ip
+        self.hostname = hostname
+        self.ip = ip
         parts = hostname.rsplit('.', 2)
-        self.sldn = '.'.join(parts[-2:-1]) if len(parts) >= 2 else ip
+        if len(parts) >=2:
+            self.sldn = '.'.join(parts[-2:-1])
+        else:
+            self.sldn = ip
 
     def __eq__(self, other):
         return type(self) is type(other) and self.sldn == other.sldn
