@@ -105,81 +105,83 @@ def scan_logs(maillogpath, mailboxlogpath, timeinterval=0, whitelist=None):
     mid2user = {}
     qid2user = {}
 
-    with open(maillogpath) as maillog, open(mailboxlogpath) as mailboxlog:
-        if timeinterval:
-            maillog.seek(0, 2)
-            mailboxlog.seek(0, 2)
-            time.sleep(timeinterval * 60)
+    maillog = open(maillogpath)
+    mailboxlog = open(mailboxlogpath)
 
-        # Mapping of message IDs to users, for those using ZWC, etc.
-        for l in mailboxlog:
-            m = get_mid2user(l)
-            if m:
-                user, messageid = m.groups()
-                user = user.lower()
-                mid2user[messageid] = user
+    if timeinterval:
+        maillog.seek(0, 2)
+        mailboxlog.seek(0, 2)
+        time.sleep(timeinterval * 60)
 
-        for l in maillog:
-            # Mapping of queue IDs to users, for direct smtp
-            m = get_qid2user(l)
-            if m:
-                queueid, host, ip, user = m.groups()
-                user = user.lower()
-                qid2user[queueid] = user
-                user2host[user].add(SmtpClient(host, ip))
+    # Mapping of message IDs to users, for those using ZWC, etc.
+    for l in mailboxlog:
+        m = get_mid2user(l)
+        if m:
+            user, messageid = m.groups()
+            user = user.lower()
+            mid2user[messageid] = user
+
+    for l in maillog:
+        # Mapping of queue IDs to users, for direct smtp
+        m = get_qid2user(l)
+        if m:
+            queueid, host, ip, user = m.groups()
+            user = user.lower()
+            qid2user[queueid] = user
+            user2host[user].add(SmtpClient(host, ip))
+            continue
+
+        # Mapping of queue IDs via message IDs to users, for ZWC, etc.
+        m = get_mid2qid(l)
+        if m:
+            queueid, messageid = m.groups()
+            if messageid in mid2user:
+                qid2user[queueid] = mid2user[messageid]
+            elif queueid not in qid2user:
+                qid2user[queueid] = 'Unknown'
+            continue
+
+        # Mapping of messages (from address and count)
+        # via queue IDs to users.
+        m = get_qid2from(l)
+        if m:
+            queueid, fromaddr, num_recipients = m.groups()
+            # just use lowercase version of fromaddr
+            fromaddr = fromaddr.lower()
+            num_recipients = int(num_recipients)
+
+            if queueid not in qid2user:
+                # Log entries for message are split between runs--ignore
                 continue
+            user = qid2user[queueid]
 
-            # Mapping of queue IDs via message IDs to users, for ZWC, etc.
-            m = get_mid2qid(l)
-            if m:
-                queueid, messageid = m.groups()
-                if messageid in mid2user:
-                    qid2user[queueid] = mid2user[messageid]
-                elif queueid not in qid2user:
-                    qid2user[queueid] = 'Unknown'
+            # At this point, the following are possible:
+            #
+            # 1. username and fromaddr
+            #    Normal; log it
+            # 2. username, no fromaddr
+            #    Set fromaddr to mailer-daemon and log it
+            # 3. no username, fromaddr
+            #    Can happen (e.g. CalendarInviteForwardSender); don't log,
+            #    since they would all be for user 'Unknown'
+            # 4. no username, no fromaddr
+            #    Don't log, for same reason
+
+            if user == 'Unknown':
                 continue
+            if not fromaddr:
+                fromaddr = 'mailer-daemon'
 
-            # Mapping of messages (from address and count)
-            # via queue IDs to users.
-            m = get_qid2from(l)
-            if m:
-                queueid, fromaddr, num_recipients = m.groups()
-                # just use lowercase version of fromaddr
-                fromaddr = fromaddr.lower()
-                num_recipients = int(num_recipients)
+            # check for outside address and update count
+            if (
+                fromaddr != 'mailer-daemon'
+                and not fromaddr.endswith(MY_DOMAIN)
+                and fromaddr not in whitelist
+                ):
+                outside[(user, fromaddr)] += num_recipients
 
-                if queueid not in qid2user:
-                    # Log entries for message are split between runs--ignore
-                    continue
-                user = qid2user[queueid]
-
-                # At this point, the following are possible:
-                #
-                # 1. username and fromaddr
-                #    Normal; log it
-                # 2. username, no fromaddr
-                #    Set fromaddr to mailer-daemon and log it
-                # 3. no username, fromaddr
-                #    Can happen (e.g. CalendarInviteForwardSender); don't log,
-                #    since they would all be for user 'Unknown'
-                # 4. no username, no fromaddr
-                #    Don't log, for same reason
-
-                if user == 'Unknown':
-                    continue
-                if not fromaddr:
-                    fromaddr = 'mailer-daemon'
-
-                # check for outside address and update count
-                if (
-                    fromaddr != 'mailer-daemon'
-                    and not fromaddr.endswith(MY_DOMAIN)
-                    and fromaddr not in whitelist
-                    ):
-                    outside[(user, fromaddr)] += num_recipients
-
-                # update individual count
-                counts[user] += num_recipients
+            # update individual count
+            counts[user] += num_recipients
 
     return counts, outside, user2host
 
@@ -193,7 +195,7 @@ def check_threshold(senders, threshold, message=""):
     The current implementation prints elements in descending order of count.
     '''
     # sort senders based on each element's count (which is its second item)
-    senders  = sorted(senders, key=itemgetter(1), reverse=True)
+    senders = sorted(senders, key=itemgetter(1), reverse=True)
 
     # only proceed if the first element's count is greater than the threshold
     if senders and senders[0][1] >= threshold:
@@ -208,14 +210,14 @@ def main(options):
 
     # Open the whitelist file, but ignore it if we can't
     try:
-        with open(options.whitelist) as whitelistfile:
-            whitelist = whitelistfile.read().lower().split('\n')
+        whitelistfile = open(options.whitelist)
+        whitelist = whitelistfile.read().lower().split('\n')
     except IOError:
         whitelist = None
 
     counts, outside, user2host = scan_logs(
-            options.maillog, options.mailboxlog,
-            options.timeinterval, whitelist
+        options.maillog, options.mailboxlog,
+        options.timeinterval, whitelist
     )
 
     # sort on messages sent (second field), most to least
