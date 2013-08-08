@@ -1,0 +1,45 @@
+#!/usr/bin/perl
+
+# Munin plugin for counting total accounts in zimbra and number of accounts
+# on this server.
+
+use strict;
+
+my $total;
+my @accounts;
+my $accounts;
+
+if ($ARGV[0]) {
+    if ($ARGV[0] eq "autoconfig") {
+        print "yes\n";
+    } elsif ($ARGV[0] eq "config") {
+        print <<EOD;
+graph_title Zimbra Accounts
+graph_args --base 1000 -l 0
+graph_scale no
+graph_vlabel Number of Zimbra accounts
+graph_category zimbra
+total.label Total Accounts
+total.type GAUGE
+total.min 0
+local.label Local Accounts
+local.type GAUGE
+local.min 0
+EOD
+    }
+    exit 0;
+}
+
+open (COMMAND, "/opt/zimbra/bin/zmsoap -z GetLicenseRequest |") or
+    die "Could not run zmsoap for reading: $!\n";
+
+while (<COMMAND>) {
+   $total = $1 if (/"TotalAccounts">(\d+)</);
+}
+print "total.value $total\n";
+
+open (COMMAND, "/opt/zimbra/bin/zmprov -l gaa -s $ENV{'HOSTNAME'} |") or
+    die "Count not run zmprov for reading: $!\n";
+@accounts = <COMMAND>;
+$accounts = $#accounts + 1;
+print "local.value $accounts\n";
